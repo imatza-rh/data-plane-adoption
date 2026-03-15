@@ -46,6 +46,53 @@
   retries: 60
   delay: "{{ dataplane_retry_delay }}"
 
+# Workaround: ironic-operator conductor dnsmasq template is missing UEFI iPXE
+# boot directives. Patch must be applied here (not in ironic_adoption) because
+# later CR patches (nova_ffu) can trigger operator reconciliation that recreates
+# the conductor pod and wipes earlier patches.
+- name: Patch conductor dnsmasq for UEFI iPXE boot chain
+  when:
+    - ironic_conductor_dnsmasq_uefi_fix | default(false) | bool
+    - "'pre_launch_ironic.bash' in prelaunch_test_instance_scripts | default([])"
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    CONDUCTOR_POD=$(oc get pods -n openstack -l component=conductor \
+      -o jsonpath='{.items[0].metadata.name}')
+
+    # Skip if already patched (idempotent)
+    if oc exec -n openstack "$CONDUCTOR_POD" -c dnsmasq -- \
+        grep -q 'dhcp-boot=tag:efi,tag:!ipxe' /var/lib/ironic/dnsmasq.conf; then
+      echo "dnsmasq UEFI boot directives already present"
+      exit 0
+    fi
+
+    # Get conductor IP on the ironic/provisioning network
+    # NAD name is 'openstack/ironic', interface is 'ironic'
+    CONDUCTOR_IP=$(oc get pod -n openstack "$CONDUCTOR_POD" \
+      -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}' | \
+      python3 -c "import sys,json; nets=json.load(sys.stdin); print([n['ips'][0] for n in nets if 'ironic' in n.get('name','') or 'ironic' in n.get('interface','')][0])")
+
+    if [ -z "$CONDUCTOR_IP" ]; then
+      echo "ERROR: Could not determine conductor IP on ironic network"
+      exit 1
+    fi
+    echo "Conductor IP: $CONDUCTOR_IP"
+
+    # Patch the source config (survives container restart via kolla_set_configs)
+    oc exec -n openstack "$CONDUCTOR_POD" -c dnsmasq -- sh -c \
+      "printf '\n# UEFI iPXE boot chain (ironic-operator bug workaround)\ndhcp-boot=tag:efi,tag:!ipxe,snponly.efi\ndhcp-boot=tag:ipxe,http://%s:8088/boot.ipxe\n' \
+        '${CONDUCTOR_IP}' >> /var/lib/ironic/dnsmasq.conf"
+
+    # Restart dnsmasq to pick up new config (PID 1 = dnsmasq -k)
+    oc exec -n openstack "$CONDUCTOR_POD" -c dnsmasq -- kill 1
+    sleep 15
+    oc wait -n openstack --for condition=Ready --timeout=120s pod/"$CONDUCTOR_POD"
+
+    # Verify the patch is active in the live config
+    oc exec -n openstack "$CONDUCTOR_POD" -c dnsmasq -- \
+      grep 'dhcp-boot=tag:efi,tag:!ipxe' /etc/dnsmasq.conf
+
 - name: Provision new instance on ironic
   when:
     - prelaunch_test_instance|bool
